@@ -428,6 +428,7 @@ def step_residual(
     """
     return (vk - vk1).pow(2).mean() / dt
 
+# here has problem
 def global_residual(
     model: nn.Module,
     z0: torch.Tensor,
@@ -441,17 +442,13 @@ def global_residual(
     """
     device = z0.device
     
-    # 计算初始速度
     v_initial = model(torch.full((z0.shape[0],), 0.0, device=device), z0)
     
-    # 积分到最终状态
     traj = integrate_ode(model, z0, solver, n_steps)
     x_final = traj[-1]
     
-    # 计算最终速度
     v_final = model(torch.full((x_final.shape[0],), 1.0, device=device), x_final)
     
-    # 全局残差
     return (v_final - v_initial).pow(2).mean().item()
 
 # ─── 5. 路径打分 ────────────────────────────────────────────
@@ -551,6 +548,37 @@ def calibrate(
     print(f"[Calibrate] α={alpha:.2f}  τ={tau:.5g} (method: {scoring_method}, solver: {solver})")
     return tau
 
+
+def my_generate_samples(model, n_samples=1000, savedir="./gen_images"):
+    """Generate samples using the model and save them."""
+    os.makedirs(savedir, exist_ok=True)
+    
+    device = next(model.parameters()).device
+    model.eval()
+    
+    print(f"Generating {n_samples} samples...")
+    
+    with torch.no_grad():
+        for i in tqdm(range(n_samples), desc="Generating samples"):
+            # Generate random noise
+            z0 = torch.randn(1, 3, 32, 32, device=device)
+            
+            # Simple Euler integration
+            x = z0
+            for t in range(100):  # 100 steps
+                t_tensor = torch.full((1,), t / 100.0, device=device)
+                v = model(t_tensor, x)
+                x = x + v * 0.01  # dt = 0.01
+            
+            # Convert from [-1,1] to [0,1] range
+            x = (x * 0.5 + 0.5).clamp(0, 1)
+
+    save_path = os.path.join(savedir, f"gen_{i:06d}.png")
+    save_image(x, save_path)
+    
+    print(f"✅ Saved {n_samples} samples to {savedir}")
+
+
 # ─── 7. 推断 & 过滤（Early-Abort）──────────────────────────
 def generate_and_filter(
     model: nn.Module,
@@ -587,7 +615,7 @@ def generate_and_filter(
                 dt = 1.0 / n_steps
                 t_k = 0.0
                 x_k = z0
-                v_k = model(torch.full((x_k.shape[0],), t_k, device=device), x_k)
+                v_k = model(torch.full((1,), t_k, device=device), x_k)
                 S = 0.0
                 
                 for _ in range(n_steps):
@@ -595,7 +623,7 @@ def generate_and_filter(
                     x_k1 = x_k + v_k * dt
                     t_k1 = t_k + dt
                     # 计算下一步速度
-                    v_k1 = model(torch.full((x_k1.shape[0],), t_k1, device=device), x_k1)
+                    v_k1 = model(torch.full((1,), t_k1, device=device), x_k1)
                     # 局部分数
                     s_k = step_residual(v_k, v_k1, dt).item()
                     S = max(S, s_k)
@@ -829,16 +857,14 @@ def visualize_samples(
         return
     
     # 取前n_samples个样本
-    samples = torch.stack(gen_imgs[:n_samples])
+    samples = torch.stack(gen_imgs[:n_samples]).squeeze(1)
     samples = samples.clip(-1, 1)
+
+    # to [0, 1]
+    vis_samples = (samples * 0.5 + 0.5).clamp(0, 1)
     
     # 创建网格
-    grid = make_grid(
-        samples.view([-1, 3, 32, 32]),
-        value_range=(-1, 1),
-        padding=0,
-        nrow=8
-    )
+    grid = make_grid(vis_samples, padding=0, nrow=8)
     
     # 转换为PIL并显示
     img = ToPILImage()(grid)
@@ -904,7 +930,7 @@ def main():
     parser.add_argument("--model_path", type=str, default="examples/images/models/cifar/fm_cifar10_weights_step_400000.pt",
                        help="Path to load/save model")
     parser.add_argument("--n_cal", type=int, default=200, help="Number of calibration samples")
-    parser.add_argument("--n_test", type=int, default=10, help="Number of test samples")
+    parser.add_argument("--n_test", type=int, default=1000, help="Number of test samples")
     parser.add_argument("--alpha", type=float, default=0.1, help="False positive rate")
     parser.add_argument("--n_steps", type=int, default=100, help="Number of integration steps")
     parser.add_argument("--no_early", action="store_true", help="Disable early abort")
@@ -955,6 +981,10 @@ def main():
     else:
         print(f"\nLoading model from {args.model_path}")
         model = flowguard_model.load_model(args.model_path)
+
+
+    ##
+    # my_generate_samples(model, 10)
     
     # FlowGuard 校准
     print("\n" + "="*50)
@@ -963,8 +993,8 @@ def main():
 
     model.eval()
     
-    tau = calibrate(model, args.solver, args.n_cal, args.alpha, args.n_steps, args.scoring_method, device)
-    
+    # tau = calibrate(model, args.solver, args.n_cal, args.alpha, args.n_steps, args.scoring_method, device)
+    tau = 100
     # FlowGuard 生成与过滤
     print("\n" + "="*50)
     print("FlowGuard Generation & Filtering")
