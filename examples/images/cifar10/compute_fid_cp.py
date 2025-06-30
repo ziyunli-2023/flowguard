@@ -5,6 +5,7 @@
 
 import os
 import sys
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import torch
@@ -20,7 +21,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
 
 # Training
-flags.DEFINE_string("input_dir", "./results", help="output_directory")
+flags.DEFINE_string("input_dir", "examples/images/models/cifar", help="output_directory")
 flags.DEFINE_string("model", "otcfm", help="flow matching model type")
 flags.DEFINE_integer("integration_steps", 100, help="number of inference steps")
 flags.DEFINE_string("integration_method", "euler", help="integration method to use")
@@ -28,9 +29,33 @@ flags.DEFINE_integer("step", 400000, help="training steps")
 flags.DEFINE_integer("num_gen", 50000, help="number of samples to generate")
 flags.DEFINE_float("tol", 1e-5, help="Integrator tolerance (absolute and relative)")
 flags.DEFINE_integer("batch_size_fid", 1024, help="Batch size to compute FID")
+flags.DEFINE_string("output_dir", "examples/images/cifar10/logs", help="output_directory")
 
 FLAGS(sys.argv)
 
+# Setup logging to both terminal and file
+def setup_logging():
+    """Setup logging to both terminal and log.txt file"""
+    log_file = f"{FLAGS.output_dir}/log.txt"
+    os.makedirs(FLAGS.output_dir, exist_ok=True)
+    
+    # Create a custom print function that writes to both terminal and file
+    def log_print(*args, **kwargs):
+        # Print to terminal
+        print(*args, **kwargs)
+        
+        # Write to log file
+        with open(log_file, 'a', encoding='utf-8') as f:
+            # Convert all arguments to strings and join them
+            message = ' '.join(str(arg) for arg in args)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{timestamp}] {message}\n")
+            f.flush()  # Ensure immediate write
+    
+    return log_print
+
+# Use the logging function
+log_print = setup_logging()
 
 # Define the model
 use_cuda = torch.cuda.is_available()
@@ -49,10 +74,8 @@ new_net = UNetModelWrapper(
 
 
 # Load the model
-PATH = f"{FLAGS.input_dir}/{FLAGS.model}/{FLAGS.model}_cifar10_weights_step_{FLAGS.step}.pt"
+PATH = f"{FLAGS.input_dir}/{FLAGS.model}_cifar10_weights_step_{FLAGS.step}.pt"
 print("path: ", PATH)
-# checkpoint = torch.load(PATH, map_location=device)
-PATH = "examples/images/models/cifar/otcfm_cifar10_weights_step_400000.pt"
 checkpoint = torch.load(PATH, map_location=device)
 state_dict = checkpoint["ema_model"]
 try:
@@ -111,7 +134,7 @@ def my_gen_1_img(unused_latent):
 
 
 
-print("Start computing FID")
+log_print("Start computing FID")
 score = fid.compute_fid(
     gen=my_gen_1_img,
     dataset_name="cifar10",
@@ -121,11 +144,11 @@ score = fid.compute_fid(
     dataset_split="train",
     mode="legacy_tensorflow",
 )
-print()
-print("FID has been computed")
+log_print()
+log_print("FID has been computed")
 # print()
 # print("Total NFE: ", new_net.nfe)
-print(f"Model path: {PATH}")
+log_print(f"Model path: {PATH}")
 # print(FLAGS.integration_steps + 1)
-print("euler FID: ", score)
-print(f"{FLAGS.integration_steps} steps Euler FID: {score:.4f}")
+# print("euler FID: ", score)
+log_print(f"{FLAGS.integration_steps} steps Euler FID: {score:.4f}")
