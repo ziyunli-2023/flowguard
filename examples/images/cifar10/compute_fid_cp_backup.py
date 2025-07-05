@@ -117,7 +117,7 @@ new_net.eval()
 total_samples_processed = 0
 total_samples_filtered = 0
 
-tau = 0.04
+tau = 0.02
 
 def step_residual(
     vk: torch.Tensor,
@@ -132,7 +132,7 @@ def step_residual(
     # Calculate residual squared for each sample
     residual = (vk - vk1).pow(2)  # [batch_size, channels, height, width]
     # Average over spatial dimensions to get score for each sample
-    score = residual.mean(dim=(1,2,3)) / dt.pow(2)  # [batch_size]
+    score = residual.mean(dim=(1,2,3)) / (dt ** 2)  # [batch_size]
     return score
        
 
@@ -145,13 +145,13 @@ def my_gen_1_img_filter(unused_latent):
         t_0 = 0.0
         x_0 = x
         v_0 = new_net(torch.full((x_0.shape[0],), t_0, device=device), x_0) 
+        # Create mask to track which samples need to continue computation
+        active_mask = torch.ones(x_0.shape[0], dtype=torch.bool, device=device)
         
         # Track initial batch size
         initial_batch_size = x_0.shape[0]
         total_samples_processed += initial_batch_size
 
-        # Create mask to track which samples need to continue computation
-        active_mask = torch.ones(x_0.shape[0], dtype=torch.bool, device=device)
 
         if FLAGS.integration_method == "euler":
             print("Use method: ", FLAGS.integration_method)
@@ -161,66 +161,39 @@ def my_gen_1_img_filter(unused_latent):
                 # Only compute for active samples
                 if not active_mask.any():
                     break  # Exit early if all samples are filtered out
-                
-                x_1 = x_0[active_mask] + v_0[active_mask] * dt
-                v_1 = new_net(torch.full((x_1.shape[0],), dt * (step + 1), device=device), x_1)
 
-                s_k = step_residual(v_0, v_1, dt)
+                # Only compute for active samples to save computation
+                x_1 = x_0 + v_0 * dt
+                v_1_active = new_net(torch.full((active_mask.sum(),), dt * (step + 1), device=device), x_1[active_mask])   
 
-                active_mask[s_k > tau] = False
-                x_2 = x_1[active_mask] + v_1[active_mask] * dt
-                v_2 = new_net(torch.full((x_2.shape[0],), dt * (step + 2), device=device), x_2) 
+                # Create full v_1 tensor, only update active positions
+                v_1 = v_0.clone()  # Start with previous velocity
+                v_1[active_mask] = v_1_active  # use the previous velocity to update the active positions
 
-                s_k = step_residual(v_1, v_2, dt)
+                s_k = step_residual(v_0, v_1, dt) # if v1 is stable, will go the next step
 
-                active_mask[s_k > tau] = False
-                x_3 = x_2[active_mask] + v_2[active_mask] * dt
-                v_3 = new_net(torch.full((x_3.shape[0],), dt * (step + 3), device=device), x_3) 
+                active_mask[s_k > tau] = False # current step's active mask
+                print(f"Step {step}: {active_mask.sum().item()}/{x_0.shape[0]} samples active")
+                print(f"mask: {active_mask}")
 
-                
-
-
-
-
-
-
-
+                x_0 = x_1
+                v_0 = v_1
 
                 
-                # # Only process active samples
-                # x_k_active = x_k[active_mask]
-                # v_k_active = v_k[active_mask]
-                
-                # # Euler one-step integration
-                # t_k1 = t_k + dt
-                # x_k1_active = x_k_active + v_k_active * dt
-                # t_k1_active = torch.full((x_k1_active.shape[0],), t_k1, device=device)
-                # v_k1_active = new_net(t_k1_active, x_k1_active)
-                
-                # # Calculate residual per sample
-                # s_k_active = step_residual(v_k_active, v_k1_active, dt)
-                
-                # # Create new active mask for current active samples
-                # new_active_mask = s_k_active < tau
-                
-                # # Update the global active mask correctly
-                # # Set all currently active samples to False first
-                # active_mask[active_indices] = False
-                # # Then set only the ones that should remain active to True
-                # active_mask[active_indices[new_active_mask]] = True
-                
-                # # Update state for samples that remain active
-                # if new_active_mask.any():
-                #     remaining_active_indices = active_indices[new_active_mask]
-                #     x_k[remaining_active_indices] = x_k1_active[new_active_mask]
-                #     v_k[remaining_active_indices] = v_k1_active[new_active_mask]
-                
-                # t_k = t_k1
+                # x_1 = x_0[active_mask] + v_0[active_mask] * dt
+                # v_1 = new_net(torch.full((x_1.shape[0],), dt * (step + 1), device=device), x_1)
+
+                # s_k = step_residual(v_0[active_mask], v_1, dt) # if v1 is stable, will go the next step
+                # active_mask[s_k > tau] = False
+                # print(f"Step {step}: {active_mask.sum().item()}/{x_0.shape[0]} samples active")
+
+                # x_0 = x_1
+                # v_0 = v_1
                 
                 # Optional: print current number of active samples
                 if step % 10 == 0:
                     active_count = active_mask.sum().item()
-                    print(f"Step {step}: {active_count}/{x_k.shape[0]} samples active")
+                    print(f"Step {step}: {active_count}/{x_1.shape[0]} samples active")
             
             # Count filtered samples for this batch
             filtered_in_batch = initial_batch_size - active_mask.sum().item()
@@ -266,7 +239,7 @@ def compute_filter_percentage():
         return 0.0
     return (total_samples_filtered / total_samples_processed) * 100.0
 
-
+my_gen_1_img_filter(torch.randn(10, 3, 32, 32, device=device))
 log_print("Start computing FID with filtering")
 score = fid.compute_fid(
     gen=my_gen_1_img_filter,
