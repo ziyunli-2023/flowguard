@@ -6,6 +6,7 @@
 import os
 import sys
 from datetime import datetime
+from tkinter import N
 
 import matplotlib.pyplot as plt
 import torch
@@ -13,7 +14,9 @@ from absl import app, flags
 from cleanfid import fid
 from torchdiffeq import odeint
 from torchdyn.core import NeuralODE
-
+from tqdm import tqdm
+import math
+import numpy as np
 from torchcfm.models.unet.unet import UNetModelWrapper
 
 FLAGS = flags.FLAGS
@@ -23,10 +26,10 @@ flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
 # Training
 flags.DEFINE_string("input_dir", "examples/images/models/cifar", help="output_directory")
 flags.DEFINE_string("model", "otcfm", help="flow matching model type")
-flags.DEFINE_integer("integration_steps", 2, help="number of inference steps") # 100
+flags.DEFINE_integer("integration_steps", 100, help="number of inference steps") # 100
 flags.DEFINE_string("integration_method", "euler", help="integration method to use")
 flags.DEFINE_integer("step", 400000, help="training steps")
-flags.DEFINE_integer("num_gen", 50, help="number of samples to generate") # 50000
+flags.DEFINE_integer("num_gen", 50000, help="number of samples to generate") # 50000
 flags.DEFINE_float("tol", 1e-5, help="Integrator tolerance (absolute and relative)")
 flags.DEFINE_integer("batch_size_fid", 10, help="Batch size to compute FID") # 1024
 flags.DEFINE_string("output_dir", "examples/images/cifar10/logs", help="output_directory")
@@ -117,12 +120,72 @@ new_net.eval()
 total_samples_processed = 0
 total_samples_filtered = 0
 
-tau = 0.02
+def score_path(
+    z0: torch.Tensor,
+    solver: str = "euler",
+    n_steps: int = 100,
+    scoring_method: str = "local"
+):
+
+    if solver in ["euler", "rk4", "adaptive_euler"]:
+        device = z0.device
+        dt = 1.0 / n_steps
+        t_k = 0.0
+        x_k = z0
+        v_k = new_net(torch.full((x_k.shape[0],), t_k, device=device), x_k)
+        s_max = 0.0
+        
+        for i in range(n_steps):
+
+            x_k1 = x_k + v_k * dt
+            t_k1 = t_k + dt
+
+            v_k1 = new_net(torch.full((x_k1.shape[0],), t_k1, device=device), x_k1)
+
+            s_k = step_residual(v_k, v_k1, dt, t_k1).item()
+            # print(f"i: {i}, s_k: {s_k}")
+            s_max = max(s_max, s_k)
+
+            x_k, v_k, t_k = x_k1, v_k1, t_k1
+            
+        # show image
+        # img = (x_k * 127.5 + 128).clip(0, 255).to(torch.uint8)
+        # plt.imshow(img[0].cpu().permute(1, 2, 0))
+        # plt.show()
+        print()
+        print(f"s_max: {s_max}")
+        return x_k, s_max
+
+
+def calibrate(
+    solver: str = "euler",
+    n_cal: int = 2000,
+    alpha: float = 0.1,
+    n_steps: int = 30,
+    scoring_method: str = "local",
+    device: str = "cuda"
+) -> float:
+
+    scores = []
+    for _ in tqdm(range(n_cal), desc=f"Calibrating ({scoring_method}, {solver})"):
+        z0 = torch.randn(1, 3, 32, 32, device=device)  # CIFAR-10: 3 channels, 32x32
+        _, s = score_path(z0, solver, n_steps, scoring_method)
+        scores.append(s)
+    
+    k = math.ceil((1 - alpha) * (n_cal + 1))
+    tau = np.partition(scores, k - 1)[k - 1]
+    np.save(f"scores_cifar_{scoring_method}_{solver}.npy", scores)
+    np.save(f"tau_cifar_{scoring_method}_{solver}.npy", tau)
+    print(f"[Calibrate] α={alpha:.2f}  τ={tau:.5g} (method: {scoring_method}, solver: {solver})")
+    return tau
+
+
 
 def step_residual(
     vk: torch.Tensor,
     vk1: torch.Tensor,
-    dt: float = 1.0
+    dt: float = 1.0,
+    t_k: float = 0.0,
 ) -> torch.Tensor:
     """
     Compute score for each sample in the batch:
@@ -132,7 +195,7 @@ def step_residual(
     # Calculate residual squared for each sample
     residual = (vk - vk1).pow(2)  # [batch_size, channels, height, width]
     # Average over spatial dimensions to get score for each sample
-    score = residual.mean(dim=(1,2,3)) / (dt ** 2)  # [batch_size]
+    score = residual.mean(dim=(1,2,3)) * ((1 - t_k)**2 / dt) # [batch_size]
     return score
        
 
@@ -163,14 +226,14 @@ def my_gen_1_img_filter(unused_latent):
                     break  # Exit early if all samples are filtered out
 
                 # Only compute for active samples to save computation
-                x_1 = x_0 + v_0 * dt
-                v_1_active = new_net(torch.full((active_mask.sum(),), dt * (step + 1), device=device), x_1[active_mask])   
+                x_1 = x_0 + v_0 * dt # go one step forward
+                v_1_active = new_net(torch.full((active_mask.sum(),), dt * (step + 1), device=device), x_1[active_mask])   # compute the velocity at the new position
 
                 # Create full v_1 tensor, only update active positions
                 v_1 = v_0.clone()  # Start with previous velocity
                 v_1[active_mask] = v_1_active  # use the previous velocity to update the active positions
 
-                s_k = step_residual(v_0, v_1, dt) # if v1 is stable, will go the next step
+                s_k = step_residual(v_0, v_1, dt, dt * (step + 1)) # if v1 is stable, will go the next step
 
                 active_mask[s_k > tau] = False # current step's active mask
                 print(f"Step {step}: {active_mask.sum().item()}/{x_0.shape[0]} samples active")
@@ -178,29 +241,18 @@ def my_gen_1_img_filter(unused_latent):
 
                 x_0 = x_1
                 v_0 = v_1
-
                 
-                # x_1 = x_0[active_mask] + v_0[active_mask] * dt
-                # v_1 = new_net(torch.full((x_1.shape[0],), dt * (step + 1), device=device), x_1)
-
-                # s_k = step_residual(v_0[active_mask], v_1, dt) # if v1 is stable, will go the next step
-                # active_mask[s_k > tau] = False
-                # print(f"Step {step}: {active_mask.sum().item()}/{x_0.shape[0]} samples active")
-
-                # x_0 = x_1
-                # v_0 = v_1
-                
-                # Optional: print current number of active samples
-                if step % 10 == 0:
-                    active_count = active_mask.sum().item()
-                    print(f"Step {step}: {active_count}/{x_1.shape[0]} samples active")
+                # # Optional: print current number of active samples
+                # if step % 10 == 0:
+                #     active_count = active_mask.sum().item()
+                #     print(f"Step {step}: {active_count}/{x_1.shape[0]} samples active")
             
             # Count filtered samples for this batch
             filtered_in_batch = initial_batch_size - active_mask.sum().item()
             total_samples_filtered += filtered_in_batch
             
             # Final result: use the last state
-            traj = x_0
+            traj = x_0[active_mask]
             
         else:
             print("Use method: ", FLAGS.integration_method)
@@ -239,7 +291,10 @@ def compute_filter_percentage():
         return 0.0
     return (total_samples_filtered / total_samples_processed) * 100.0
 
+# tau = calibrate(solver="euler", n_cal=2000, alpha=0.1, n_steps=FLAGS.integration_steps, scoring_method="local", device=device)
+tau = 0.087718
 my_gen_1_img_filter(torch.randn(10, 3, 32, 32, device=device))
+
 log_print("Start computing FID with filtering")
 score = fid.compute_fid(
     gen=my_gen_1_img_filter,
